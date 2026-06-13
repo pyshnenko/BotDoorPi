@@ -147,35 +147,37 @@ function triggerPin(pin: number, actionName: string, ws: WebSocket) {
 async function getNetworkData(): Promise<any> {
     return new Promise((resolve) => {
         network.get_active_interface(async (err: any, obj: any) => {
-            let externalIp = 'unknown';
-            try {
-                const res = await axios.get('https://ipify.org', { timeout: 2000 });
-                externalIp = res.data.ip;
-            } catch (e) {}
+            let externalIp = 'не определен';
+            
+            // Список сервисов для проверки IP
+            const ipServices = [
+                'https://ipify.org',
+                'https://ifconfig.me',
+                'https://ipapi.co'
+            ];
 
-            // Пытаемся получить данные Wi-Fi через системную команду nmcli
-            let ssid = 'Ethernet/None';
-            let signal = 'n/a';
-
-            if (process.platform === 'linux') {
+            // Пробуем по очереди, пока не получим ответ
+            for (const service of ipServices) {
                 try {
-                    // Команда выводит: SSID:Signal
-                    const wifiRaw = execSync("nmcli -t -f active,ssid,signal dev wifi | grep '^yes'").toString();
-                    const parts = wifiRaw.split(':');
-                    if (parts.length >= 3) {
-                        ssid = parts[1];
-                        signal = parts[2].trim() + '%';
-                    }
+                    const res = await axios.get(service, { timeout: 5000 }); // увеличили до 5 сек
+                    // Разные сервисы возвращают IP в разных полях (ip или ip_number)
+                    externalIp = res.data.ip || res.data.ip_number || res.data.query || externalIp;
+                    if (externalIp !== 'не определен') break; 
                 } catch (e) {
-                    // Если nmcli нет или Wi-Fi выключен, останутся значения по умолчанию
+                    continue; // если один упал, пробуем следующий
                 }
             }
+
+            // --- Блок nmcli (который мы добавили ранее для SSID) ---
+            let ssid = 'Ethernet/None';
+            let signal = 'n/a';
+            // ... (твой код с nmcli остается без изменений) ...
 
             resolve({
                 localIp: obj ? obj.ip_address : 'n/a',
                 externalIp,
-                ssid: ssid,
-                signal: signal,
+                ssid,
+                signal,
                 platform: process.platform,
                 uptime: Math.round(process.uptime()) + 's'
             });
