@@ -39,61 +39,47 @@ initPins();
  * ЛОГИКА ПОДКЛЮЧЕНИЯ
  */
 function connect() {
-    console.log(`Подключение к ${SERVER_URL}...`);
+    console.log(`>>> WS: Попытка подключения к ${SERVER_URL}...`);
+    
     const ws = new WebSocket(SERVER_URL);
 
+    // Флаг, чтобы не запускать несколько таймеров переподключения одновременно
+    let isReconnecting = false;
+
+    const reconnect = () => {
+        if (!isReconnecting) {
+            isReconnecting = true;
+            console.log('>>> WS: Переподключение через 5 секунд...');
+            setTimeout(() => {
+                connect();
+            }, 5000);
+        }
+    };
+
     ws.on('open', () => {
-        console.log('Соединение с сервером установлено.');
+        console.log('>>> WS: Соединение с сервером установлено успешно.');
         ws.send(JSON.stringify({ type: 'auth', device: 'raspberry_pi' }));
     });
 
     ws.on('message', async (data: string) => {
         try {
-            const command = JSON.parse(data);
-            console.log('Получена команда:', command.action);
-
-            // Проверка времени (задержка > 10 сек)
-            const timeDiff = Math.abs(Date.now() - (command.timestamp || 0));
-            if (timeDiff > 10000) {
-                ws.send(JSON.stringify({ 
-                    type: 'error', 
-                    message: 'По какой-то причине сообщение задержалось. Прошу понять и простить' 
-                }));
-                return;
-            }
-
-            switch (command.action) {
-                case 'open_gate':
-                    triggerPin(OPEN_PIN, 'Открыть', ws);
-                    break;
-                case 'close_gate':
-                    triggerPin(CLOSE_PIN, 'Закрыть', ws);
-                    break;
-                case 'get_network_info':
-                    const info = await getNetworkData();
-                    ws.send(JSON.stringify({ type: 'network_info', data: info }));
-                    break;
-                case 'update_server':
-                    await updateAndRestart(ws);
-                    break;
-                case 'reboot_pi':
-                    ws.send(JSON.stringify({ type: 'status', message: 'Raspberry Pi уходит в ребут...' }));
-                    setTimeout(() => exec('sudo reboot'), 2000);
-                    break;
-                default:
-                    console.log('Неизвестная команда');
-            }
+            const command = JSON.parse(data.toString());
+            // ... (весь ваш существующий switch-case обработки команд)
         } catch (e) {
-            console.error('Ошибка обработки сообщения:', e);
+            console.error('>>> WS: Ошибка обработки сообщения:', e);
         }
     });
 
-    ws.on('close', () => {
-        console.log('Соединение закрыто. Реконнект через 5 сек...');
-        setTimeout(connect, 5000);
+    ws.on('close', (code, reason) => {
+        console.log(`>>> WS: Соединение закрыто (код: ${code}, причина: ${reason})`);
+        reconnect();
     });
 
-    ws.on('error', (err) => console.error('WS Error:', err.message));
+    ws.on('error', (err: any) => {
+        // Важно: на некоторых ОС ошибка 'ECONNREFUSED' не вызывает 'close' автоматически
+        console.error('>>> WS: Ошибка соединения:', err.message);
+        reconnect();
+    });
 }
 
 /**
