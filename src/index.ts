@@ -149,35 +149,53 @@ async function getNetworkData(): Promise<any> {
         network.get_active_interface(async (err: any, obj: any) => {
             let externalIp = 'не определен';
             
-            // Список сервисов для проверки IP
-            const ipServices = [
+            // Пробуем несколько сервисов по очереди
+            const providers = [
                 'https://ipify.org',
                 'https://ifconfig.me',
                 'https://ipapi.co'
             ];
 
-            // Пробуем по очереди, пока не получим ответ
-            for (const service of ipServices) {
+            for (const url of providers) {
                 try {
-                    const res = await axios.get(service, { timeout: 5000 }); // увеличили до 5 сек
-                    // Разные сервисы возвращают IP в разных полях (ip или ip_number)
-                    externalIp = res.data.ip || res.data.ip_number || res.data.query || externalIp;
-                    if (externalIp !== 'не определен') break; 
+                    const res = await axios.get(url, { timeout: 5000 }); // Увеличили до 5 секунд
+                    externalIp = res.data.ip || res.data.ip_number || res.data.query || 'не определен';
+                    if (externalIp !== 'не определен') break;
                 } catch (e) {
-                    continue; // если один упал, пробуем следующий
+                    // Если один сервис упал, пробуем следующий
+                    continue;
                 }
             }
 
-            // --- Блок nmcli (который мы добавили ранее для SSID) ---
+            // Блок получения Wi-Fi через nmcli (оставляем без изменений)
             let ssid = 'Ethernet/None';
             let signal = 'n/a';
-            // ... (твой код с nmcli остается без изменений) ...
+            if (process.platform === 'linux') {
+                try {
+                    const wifiRaw = execSync("nmcli -t -f active,ssid,signal dev wifi | grep '^yes'").toString();
+                    const parts = wifiRaw.split(':');
+                    if (parts.length >= 3) {
+                        ssid = parts[1];
+                        signal = parts[2].trim() + '%';
+                    }
+                } catch (e) {}
+            }
+
+            // Добавим температуру процессора (бонусом, раз залезли в код)
+            let temp = 'n/a';
+            if (process.platform === 'linux') {
+                try {
+                    const tempRaw = fs.readFileSync('/sys/class/thermal/thermal_zone0/temp', 'utf8');
+                    temp = (parseInt(tempRaw) / 1000).toFixed(1) + '°C';
+                } catch (e) {}
+            }
 
             resolve({
                 localIp: obj ? obj.ip_address : 'n/a',
                 externalIp,
                 ssid,
                 signal,
+                temp, // Новое поле
                 platform: process.platform,
                 uptime: Math.round(process.uptime()) + 's'
             });
