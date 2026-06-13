@@ -1,54 +1,13 @@
 import WebSocket from 'ws';
-//import { Gpio } from 'onoff';
 import network from 'network';
 import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
+import { exec, execSync } from 'child_process';
 import os from 'os';
 import dotenv from 'dotenv';
-import { IncomingMessage, WifiSettings, NetworkInfoResponse, NetworkInterface } from './types';
 
 dotenv.config();
-
-/**
- * ОПРЕДЕЛЕНИЕ ПЛАТФОРМЫ
- * На Windows библиотеки для GPIO (onoff) не установятся,
- * поэтому мы используем динамический импорт.
- */
-const isPi = process.platform === 'linux' && (os.arch().includes('arm') || os.arch().includes('aarch64'));
-
-let openGatePin: any;
-let closeGatePin: any;
-
-if (isPi) {
-    try {
-        // Динамическое подключение только на Raspberry Pi
-        const { Gpio } = require('onoff');
-        openGatePin = new Gpio(27, 'out');
-        closeGatePin = new Gpio(22, 'out');
-        console.log('>>> СИСТЕМА: Raspberry Pi (GPIO 27, 22 готовы)');
-    } catch (e) {
-        console.error('>>> ОШИБКА: Не удалось загрузить onoff на Linux', e);
-        setupMockPins();
-    }
-} else {
-    console.log(`>>> СИСТЕМА: ${process.platform} (Эмуляция GPIO)`);
-    setupMockPins();
-}
-
-function setupMockPins() {
-    const createMock = (pin: number) => ({
-        writeSync: (val: number) => console.log(`[GPIO MOCK] Пин ${pin} установлен в: ${val}`),
-        unexport: () => console.log(`[GPIO MOCK] Пин ${pin} освобожден`)
-    });
-    openGatePin = createMock(14);
-    closeGatePin = createMock(15);
-}
-
-// Установка начального состояния (низкий уровень)
-openGatePin.writeSync(0);
-closeGatePin.writeSync(0);
 
 /**
  * КОНФИГУРАЦИЯ
@@ -57,8 +16,27 @@ const SERVER_URL = `ws://${process.env.REMOTE_SERVER_URL}:${process.env.REMOTE_S
 const UPDATE_URL = process.env.UPDATE_FILE_URL || 'https://spamigor.ru';
 const DEST_PATH = __filename;
 
+const OPEN_PIN = 27;
+const CLOSE_PIN = 22;
+
 /**
- * ЛОГИКА WEBSOCKET
+ * ИНИЦИАЛИЗАЦИЯ GPIO (через pinctrl)
+ */
+function initPins() {
+    try {
+        // Устанавливаем пины в режим вывода (op) и низкий уровень (dl)
+        execSync(`pinctrl set ${OPEN_PIN} op dl`);
+        execSync(`pinctrl set ${CLOSE_PIN} op dl`);
+        console.log(`>>> GPIO: Пины ${OPEN_PIN} и ${CLOSE_PIN} готовы (pinctrl)`);
+    } catch (e: any) {
+        console.warn('>>> GPIO Warning: pinctrl не сработал. Возможно, это Windows или старая ОС.');
+    }
+}
+
+initPins();
+
+/**
+ * ЛОГИКА ПОДКЛЮЧЕНИЯ
  */
 function connect() {
     console.log(`Подключение к ${SERVER_URL}...`);
@@ -66,148 +44,121 @@ function connect() {
 
     ws.on('open', () => {
         console.log('Соединение с сервером установлено.');
-        // Можно отправить приветственный пакет
         ws.send(JSON.stringify({ type: 'auth', device: 'raspberry_pi' }));
     });
 
     ws.on('message', async (data: string) => {
         try {
-            const message: IncomingMessage = JSON.parse(data);
-            
-            // --- ПРОВЕРКА ВРЕМЕНИ ---
-            const currentTime = Date.now();
-            const timeDiff = Math.abs(currentTime - message.timestamp);
+            const command = JSON.parse(data);
+            console.log('Получена команда:', command.action);
 
-            if (timeDiff > 10000) { // 10 секунд в мс
-                console.warn(`Задержка сообщения: ${timeDiff}мс`);
+            // Проверка времени (задержка > 10 сек)
+            const timeDiff = Math.abs(Date.now() - (command.timestamp || 0));
+            if (timeDiff > 10000) {
                 ws.send(JSON.stringify({ 
                     type: 'error', 
                     message: 'По какой-то причине сообщение задержалось. Прошу понять и простить' 
                 }));
-                return; // Прекращаем выполнение команды
+                return;
             }
-            // ------------------------
 
-            switch (message.action) {
+            switch (command.action) {
                 case 'open_gate':
-                    triggerPin(openGatePin, 'Открыть', ws); // передаем сокет
+                    triggerPin(OPEN_PIN, 'Открыть', ws);
                     break;
                 case 'close_gate':
-                    triggerPin(closeGatePin, 'Закрыть', ws); // передаем сокет
+                    triggerPin(CLOSE_PIN, 'Закрыть', ws);
                     break;
                 case 'get_network_info':
-                    const netInfo = await getNetworkData();
-                    ws.send(JSON.stringify({ type: 'network_info', data: netInfo }));
+                    const info = await getNetworkData();
+                    ws.send(JSON.stringify({ type: 'network_info', data: info }));
                     break;
                 case 'update_server':
-                    await runAutoUpdate(ws);
+                    await updateAndRestart(ws);
                     break;
                 case 'reboot_pi':
-                    console.log('Получена команда на перезагрузку...');
-                    const { exec } = require('child_process');
-                    // Даем небольшую задержку, чтобы успеть отправить ответ серверу
-                    setTimeout(() => {
-                        exec('sudo reboot');
-                    }, 2000);
-                    ws.send(JSON.stringify({ type: 'status', message: 'Raspberry Pi уходит в перезагрузку...' }));
+                    ws.send(JSON.stringify({ type: 'status', message: 'Raspberry Pi уходит в ребут...' }));
+                    setTimeout(() => exec('sudo reboot'), 2000);
                     break;
+                default:
+                    console.log('Неизвестная команда');
             }
         } catch (e) {
-            console.error('Ошибка обработки:', e);
+            console.error('Ошибка обработки сообщения:', e);
         }
     });
 
-    ws.on('close', () => setTimeout(connect, 5000));
+    ws.on('close', () => {
+        console.log('Соединение закрыто. Реконнект через 5 сек...');
+        setTimeout(connect, 5000);
+    });
+
     ws.on('error', (err) => console.error('WS Error:', err.message));
 }
 
 /**
  * ФУНКЦИИ УПРАВЛЕНИЯ
  */
-function triggerPin(pin: any, actionName: string, ws: WebSocket) {
-    pin.writeSync(1);
-    console.log(`Сигнал ${actionName}: ВЫСОКИЙ (1 сек)`);
-    
-    // ОТПРАВЛЯЕМ ПОДТВЕРЖДЕНИЕ СЕРВЕРУ СРАЗУ
-    ws.send(JSON.stringify({ 
-        type: 'success', 
-        message: `Команда ${actionName} получена и выполняется` 
-    }));
+function triggerPin(pin: number, actionName: string, ws: WebSocket) {
+    try {
+        if (process.platform === 'linux') {
+            execSync(`pinctrl set ${pin} dh`); // High
+            setTimeout(() => execSync(`pinctrl set ${pin} dl`), 1000); // Low через 1 сек
+        } else {
+            console.log(`[MOCK] Пин ${pin} -> HIGH на 1 сек`);
+        }
 
-    setTimeout(() => {
-        pin.writeSync(0);
-        console.log(`Сигнал ${actionName}: НИЗКИЙ`);
-    }, 1000);
+        ws.send(JSON.stringify({ 
+            type: 'success', 
+            message: `Команда ${actionName} выполняется` 
+        }));
+    } catch (e: any) {
+        console.error(`Ошибка переключения пина ${pin}:`, e.message);
+    }
 }
 
-async function getNetworkData(): Promise<NetworkInfoResponse> {
+async function getNetworkData(): Promise<any> {
     return new Promise((resolve) => {
-        network.get_active_interface(async (err: Error | null, obj: NetworkInterface) => {
+        network.get_active_interface(async (err: any, obj: any) => {
             let externalIp = 'unknown';
             try {
-                const res = await axios.get<{ ip: string }>('https://ipify.org', { timeout: 2000 });
+                const res = await axios.get('https://ipify.org', { timeout: 2000 });
                 externalIp = res.data.ip;
             } catch (e) {}
 
-            // Проверяем, существует ли метод get_wifi_setting (его нет на Windows)
-            if (typeof network.get_wifi_setting === 'function') {
-                network.get_wifi_setting((errWifi: Error | null, wifi: WifiSettings) => {
-                    resolve({
-                        localIp: obj ? obj.ip_address : 'n/a',
-                        externalIp,
-                        ssid: wifi ? wifi.ssid : 'n/a',
-                        signal: wifi ? wifi.signal : 'n/a',
-                        platform: process.platform,
-                        uptime: Math.round(process.uptime()) + 's'
-                    });
-                });
-            } else {
-                // Если метода нет (Windows), возвращаем данные без Wi-Fi
+            const respond = (wifi: any = null) => {
                 resolve({
                     localIp: obj ? obj.ip_address : 'n/a',
                     externalIp,
-                    ssid: 'Unsupported (Win)',
-                    signal: 'n/a',
+                    ssid: wifi ? wifi.ssid : (process.platform === 'win32' ? 'Unsupported (Win)' : 'Ethernet/None'),
+                    signal: wifi ? wifi.signal : 'n/a',
                     platform: process.platform,
                     uptime: Math.round(process.uptime()) + 's'
                 });
+            };
+
+            if (typeof network.get_wifi_setting === 'function') {
+                network.get_wifi_setting((errW: any, wifi: any) => respond(wifi));
+            } else {
+                respond();
             }
         });
     });
 }
 
-async function runAutoUpdate(ws: WebSocket) {
-    ws.send(JSON.stringify({ type: 'status', message: 'Downloading update...' }));
+async function updateAndRestart(ws: WebSocket) {
     try {
-        const response = await axios.get(UPDATE_URL);
-        fs.writeFileSync(DEST_PATH, response.data);
-        console.log('Файл скачан. Компиляция...');
-
-        ws.send(JSON.stringify({ type: 'status', message: 'Building...' }));
-        
-        const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-        
-        exec(`${npmCmd} run build`, (error) => {
-            if (error) {
-                console.error('Ошибка сборки:', error);
-                ws.send(JSON.stringify({ type: 'error', message: 'Build failed' }));
-                return;
-            }
-            console.log('Обновление завершено. Перезагрузка процесса...');
-            process.exit(0); // PM2 перезапустит сервер автоматически
+        ws.send(JSON.stringify({ type: 'status', message: 'Скачивание обновления...' }));
+        const res = await axios.get(UPDATE_URL);
+        fs.writeFileSync(DEST_PATH, res.data);
+        ws.send(JSON.stringify({ type: 'status', message: 'Сборка...' }));
+        exec('npm run build', (err) => {
+            if (err) return ws.send(JSON.stringify({ type: 'error', message: 'Ошибка билда' }));
+            process.exit(0); // PM2 перезапустит
         });
-    } catch (err: any) {
-        console.error('Ошибка обновления:', err.message);
-        ws.send(JSON.stringify({ type: 'error', message: err.message }));
+    } catch (e: any) {
+        ws.send(JSON.stringify({ type: 'error', message: e.message }));
     }
 }
 
-// Запуск
 connect();
-
-// Безопасное завершение
-process.on('SIGINT', () => {
-    openGatePin.unexport();
-    closeGatePin.unexport();
-    process.exit();
-});
