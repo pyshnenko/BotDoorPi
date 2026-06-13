@@ -149,27 +149,36 @@ async function getNetworkData(): Promise<any> {
         network.get_active_interface(async (err: any, obj: any) => {
             let externalIp = 'unknown';
             try {
-                // Исправлено: запрашиваем JSON формат
                 const res = await axios.get('https://ipify.org', { timeout: 2000 });
                 externalIp = res.data.ip;
             } catch (e) {}
 
-            const respond = (wifi: any = null) => {
-                resolve({
-                    localIp: obj ? obj.ip_address : 'n/a',
-                    externalIp,
-                    ssid: wifi ? wifi.ssid : (process.platform === 'win32' ? 'Unsupported (Win)' : 'Ethernet/None'),
-                    signal: wifi ? wifi.signal : 'n/a',
-                    platform: process.platform,
-                    uptime: Math.round(process.uptime()) + 's'
-                });
-            };
+            // Пытаемся получить данные Wi-Fi через системную команду nmcli
+            let ssid = 'Ethernet/None';
+            let signal = 'n/a';
 
-            if (typeof network.get_wifi_setting === 'function') {
-                network.get_wifi_setting((errW: any, wifi: any) => respond(wifi));
-            } else {
-                respond();
+            if (process.platform === 'linux') {
+                try {
+                    // Команда выводит: SSID:Signal
+                    const wifiRaw = execSync("nmcli -t -f active,ssid,signal dev wifi | grep '^yes'").toString();
+                    const parts = wifiRaw.split(':');
+                    if (parts.length >= 3) {
+                        ssid = parts[1];
+                        signal = parts[2].trim() + '%';
+                    }
+                } catch (e) {
+                    // Если nmcli нет или Wi-Fi выключен, останутся значения по умолчанию
+                }
             }
+
+            resolve({
+                localIp: obj ? obj.ip_address : 'n/a',
+                externalIp,
+                ssid: ssid,
+                signal: signal,
+                platform: process.platform,
+                uptime: Math.round(process.uptime()) + 's'
+            });
         });
     });
 }
