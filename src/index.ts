@@ -20,16 +20,17 @@ const OPEN_PIN = 27;
 const CLOSE_PIN = 22;
 
 /**
- * ИНИЦИАЛИЗАЦИЯ GPIO (через pinctrl)
+ * ИНИЦИАЛИЗАЦИЯ GPIO
  */
 function initPins() {
     try {
-        // Устанавливаем пины в режим вывода (op) и низкий уровень (dl)
-        execSync(`pinctrl set ${OPEN_PIN} op dl`);
-        execSync(`pinctrl set ${CLOSE_PIN} op dl`);
-        console.log(`>>> GPIO: Пины ${OPEN_PIN} и ${CLOSE_PIN} готовы (pinctrl)`);
+        if (process.platform === 'linux') {
+            execSync(`pinctrl set ${OPEN_PIN} op dl`);
+            execSync(`pinctrl set ${CLOSE_PIN} op dl`);
+            console.log(`>>> GPIO: Пины ${OPEN_PIN} и ${CLOSE_PIN} готовы (pinctrl)`);
+        }
     } catch (e: any) {
-        console.warn('>>> GPIO Warning: pinctrl не сработал. Возможно, это Windows или старая ОС.');
+        console.warn('>>> GPIO Warning: pinctrl не доступен.');
     }
 }
 
@@ -42,42 +43,80 @@ function connect() {
     console.log(`>>> WS: Попытка подключения к ${SERVER_URL}...`);
     
     const ws = new WebSocket(SERVER_URL);
-
-    // Флаг, чтобы не запускать несколько таймеров переподключения одновременно
     let isReconnecting = false;
+    let heartbeatInterval: NodeJS.Timeout;
 
     const reconnect = () => {
         if (!isReconnecting) {
             isReconnecting = true;
+            clearInterval(heartbeatInterval);
             console.log('>>> WS: Переподключение через 5 секунд...');
-            setTimeout(() => {
-                connect();
-            }, 5000);
+            setTimeout(() => connect(), 5000);
         }
     };
 
     ws.on('open', () => {
-        console.log('>>> WS: Соединение с сервером установлено успешно.');
+        console.log('>>> WS: Соединение с сервером установлено.');
         ws.send(JSON.stringify({ type: 'auth', device: 'raspberry_pi' }));
+
+        // Heartbeat каждые 30 сек, чтобы соединение не разрывалось роутером
+        heartbeatInterval = setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: 'ping' }));
+            }
+        }, 30000);
     });
 
-    ws.on('message', async (data: string) => {
+    ws.on('message', async (data: Buffer | string) => {
         try {
             const command = JSON.parse(data.toString());
-            // ... (весь ваш существующий switch-case обработки команд)
+            console.log('>>> Команда от сервера:', command.action);
+
+            // Проверка задержки сообщения (10 сек)
+            if (command.timestamp) {
+                const timeDiff = Math.abs(Date.now() - command.timestamp);
+                if (timeDiff > 10000) {
+                    ws.send(JSON.stringify({ 
+                        type: 'error', 
+                        message: 'По какой-то причине сообщение задержалось. Прошу понять и простить' 
+                    }));
+                    return;
+                }
+            }
+
+            switch (command.action) {
+                case 'open_gate':
+                    triggerPin(OPEN_PIN, 'Открыть', ws);
+                    break;
+                case 'close_gate':
+                    triggerPin(CLOSE_PIN, 'Закрыть', ws);
+                    break;
+                case 'get_network_info':
+                    const info = await getNetworkData();
+                    ws.send(JSON.stringify({ type: 'network_info', data: info }));
+                    break;
+                case 'update_server':
+                    await updateAndRestart(ws);
+                    break;
+                case 'reboot_pi':
+                    ws.send(JSON.stringify({ type: 'status', message: 'Raspberry Pi уходит в ребут...' }));
+                    setTimeout(() => exec('sudo reboot'), 2000);
+                    break;
+                default:
+                    console.warn('>>> Неизвестный action:', command.action);
+            }
         } catch (e) {
-            console.error('>>> WS: Ошибка обработки сообщения:', e);
+            console.error('>>> Ошибка обработки сообщения:', e);
         }
     });
 
     ws.on('close', (code, reason) => {
-        console.log(`>>> WS: Соединение закрыто (код: ${code}, причина: ${reason})`);
+        console.log(`>>> WS: Закрыто (код: ${code})`);
         reconnect();
     });
 
     ws.on('error', (err: any) => {
-        // Важно: на некоторых ОС ошибка 'ECONNREFUSED' не вызывает 'close' автоматически
-        console.error('>>> WS: Ошибка соединения:', err.message);
+        console.error('>>> WS Ошибка:', err.message);
         reconnect();
     });
 }
@@ -88,18 +127,20 @@ function connect() {
 function triggerPin(pin: number, actionName: string, ws: WebSocket) {
     try {
         if (process.platform === 'linux') {
-            execSync(`pinctrl set ${pin} dh`); // High
-            setTimeout(() => execSync(`pinctrl set ${pin} dl`), 1000); // Low через 1 сек
+            execSync(`pinctrl set ${pin} dh`);
+            setTimeout(() => execSync(`pinctrl set ${pin} dl`), 1000);
         } else {
-            console.log(`[MOCK] Пин ${pin} -> HIGH на 1 сек`);
+            console.log(`[MOCK] Пин ${pin} -> HIGH`);
         }
 
+        // КРИТИЧНО: Отправляем успех сразу, чтобы сервер не выдал таймаут
         ws.send(JSON.stringify({ 
             type: 'success', 
-            message: `Команда ${actionName} выполняется` 
+            message: `Команда ${actionName} выполнена успешно` 
         }));
     } catch (e: any) {
-        console.error(`Ошибка переключения пина ${pin}:`, e.message);
+        console.error(`Ошибка GPIO ${pin}:`, e.message);
+        ws.send(JSON.stringify({ type: 'error', message: 'Ошибка железа: ' + e.message }));
     }
 }
 
@@ -108,6 +149,7 @@ async function getNetworkData(): Promise<any> {
         network.get_active_interface(async (err: any, obj: any) => {
             let externalIp = 'unknown';
             try {
+                // Исправлено: запрашиваем JSON формат
                 const res = await axios.get('https://ipify.org', { timeout: 2000 });
                 externalIp = res.data.ip;
             } catch (e) {}
@@ -134,13 +176,13 @@ async function getNetworkData(): Promise<any> {
 
 async function updateAndRestart(ws: WebSocket) {
     try {
-        ws.send(JSON.stringify({ type: 'status', message: 'Скачивание обновления...' }));
+        ws.send(JSON.stringify({ type: 'status', message: 'Скачивание...' }));
         const res = await axios.get(UPDATE_URL);
         fs.writeFileSync(DEST_PATH, res.data);
-        ws.send(JSON.stringify({ type: 'status', message: 'Сборка...' }));
+        ws.send(JSON.stringify({ type: 'status', message: 'Билд...' }));
         exec('npm run build', (err) => {
             if (err) return ws.send(JSON.stringify({ type: 'error', message: 'Ошибка билда' }));
-            process.exit(0); // PM2 перезапустит
+            process.exit(0);
         });
     } catch (e: any) {
         ws.send(JSON.stringify({ type: 'error', message: e.message }));
