@@ -159,6 +159,7 @@ async function getNetworkData(): Promise<any> {
             for (const url of providers) {
                 try {
                     const res = await axios.get(url, { timeout: 5000 }); // Увеличили до 5 секунд
+                    console.log(res.data)
                     externalIp = res.data.ip || res.data.ip_number || res.data.query || 'не определен';
                     if (externalIp !== 'не определен') break;
                 } catch (e) {
