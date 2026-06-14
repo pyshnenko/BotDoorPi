@@ -197,7 +197,7 @@ async function getNetworkData(): Promise<any> {
                 signal,
                 temp, // Новое поле
                 platform: process.platform,
-                uptime: Math.round(process.uptime()) + 's'
+                uptime: Math.round(process.uptime())
             });
         });
     });
