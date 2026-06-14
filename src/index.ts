@@ -151,9 +151,7 @@ async function getNetworkData(): Promise<any> {
             
             // Пробуем несколько сервисов по очереди
             const providers = [
-                'https://ipify.org',
-                'https://ifconfig.me',
-                'https://ipapi.co'
+                'https://api.ipify.org?format=json'
             ];
 
             for (const url of providers) {
