@@ -128,7 +128,7 @@ function triggerPin(pin: number, actionName: string, ws: WebSocket) {
     try {
         if (process.platform === 'linux') {
             execSync(`pinctrl set ${pin} dh`);
-            setTimeout(() => execSync(`pinctrl set ${pin} dl`), 1000);
+            setTimeout(() => execSync(`pinctrl set ${pin} dl`), 2000);
         } else {
             console.log(`[MOCK] Пин ${pin} -> HIGH`);
         }
